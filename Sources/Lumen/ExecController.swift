@@ -27,6 +27,43 @@ extension ExecError: AbortError {
 // MARK: - ExecController
 
 struct ExecController: RouteCollection {
+    /// Server-enforced maximum timeout in seconds. No command can run longer than this.
+    static let maxTimeout: Double = 60
+
+    /// Default timeout when the client doesn't specify one.
+    static let defaultTimeout: Double = 30
+
+    /// Maximum output size per stream (stdout/stderr) in bytes. Prevents memory exhaustion from
+    /// commands that produce unbounded output.
+    static let maxOutputBytes = 1_000_000 // 1 MB
+
+    /// Environment variables that cannot be overridden by the client. These control process loading
+    /// behavior and could be used for privilege escalation.
+    static let blockedEnvironmentKeys: Set<String> = [
+        "PATH",
+        "HOME",
+        "USER",
+        "SHELL",
+        "LOGNAME",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        "LUMEN_API_KEY",
+    ]
+
+    /// Privilege escalation commands blocked by default. Set LUMEN_ALLOW_SUDO=true in the
+    /// environment to permit them.
+    static let escalationCommands: [String] = ["sudo", "su", "pkexec", "doas", "runuser"]
+
+    /// Returns true if the command contains a privilege escalation call.
+    static func containsPrivilegeEscalation(_ command: String) -> Bool {
+        self.escalationCommands.contains { cmd in
+            command.range(of: "\\b\(NSRegularExpression.escapedPattern(for: cmd))\\b", options: .regularExpression) != nil
+        }
+    }
+
     func boot(routes: RoutesBuilder) throws {
         routes.post("exec", use: self.execute)
     }
@@ -35,11 +72,23 @@ struct ExecController: RouteCollection {
     func execute(req: Request) async throws -> ExecResponse {
         let body = try req.content.decode(ExecRequest.self)
         req.logger.info("exec: \(body.command)")
+
+        if Environment.get("LUMEN_ALLOW_SUDO") != "true", Self.containsPrivilegeEscalation(body.command) {
+            throw Abort(.forbidden, reason: "Privilege escalation commands (sudo, su, etc.) are blocked. Set LUMEN_ALLOW_SUDO=true to permit.")
+        }
+
+        let effectiveTimeout = min(body.timeout ?? Self.defaultTimeout, Self.maxTimeout)
+
+        let sanitizedEnv = body.environment.map { env in
+            env.filter { !Self.blockedEnvironmentKeys.contains($0.key) }
+        }
+
         return try await runCommand(
             command: body.command,
             workingDirectory: body.workingDirectory,
-            environment: body.environment,
-            timeout: body.timeout,
+            environment: sanitizedEnv,
+            timeout: effectiveTimeout,
+            maxOutputBytes: Self.maxOutputBytes,
         )
     }
 }
@@ -50,7 +99,8 @@ private func runCommand(
     command: String,
     workingDirectory: String?,
     environment: [String: String]?,
-    timeout: Double?,
+    timeout: Double,
+    maxOutputBytes: Int,
 ) async throws -> ExecResponse {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -85,27 +135,31 @@ private func runCommand(
             return
         }
 
-        // Kick off the kill task only after we know the process is running
-        if let timeout {
-            Task.detached {
-                try? await Task.sleep(for: .seconds(timeout))
-                guard process.isRunning else { return }
-                didTimeout.setValue(true)
-                process.terminate()
-            }
+        // Timeout is always enforced — kill the process if it exceeds the limit
+        Task.detached {
+            try? await Task.sleep(for: .seconds(timeout))
+            guard process.isRunning else { return }
+            didTimeout.setValue(true)
+            process.terminate()
         }
     }
 
-    let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
 
-    if let timeout, didTimeout.value {
+    if didTimeout.value {
         throw ExecError.timeout(timeout)
     }
 
+    let stdoutTruncated = stdoutData.count > maxOutputBytes
+    let stderrTruncated = stderrData.count > maxOutputBytes
+
+    let stdout = String(data: stdoutData.prefix(maxOutputBytes), encoding: .utf8) ?? ""
+    let stderr = String(data: stderrData.prefix(maxOutputBytes), encoding: .utf8) ?? ""
+
     return ExecResponse(
-        stdout: stdout,
-        stderr: stderr,
+        stdout: stdoutTruncated ? stdout + "\n[truncated — output exceeded \(maxOutputBytes / 1_000_000) MB]" : stdout,
+        stderr: stderrTruncated ? stderr + "\n[truncated — output exceeded \(maxOutputBytes / 1_000_000) MB]" : stderr,
         exitCode: Int(process.terminationStatus),
     )
 }

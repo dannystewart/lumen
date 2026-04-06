@@ -21,13 +21,35 @@ struct ExecResponse: Content {
 // MARK: - HealthResponse
 
 struct HealthResponse: Content {
-    static var current: HealthResponse {
-        HealthResponse(
-            status: "ok",
+    static var current: HealthResponse { HealthResponse(status: "ok") }
+
+    let status: String
+}
+
+// MARK: - InfoResponse
+
+/// Response from a Lumen node's authenticated `GET /info` endpoint. Contains server identity
+/// information that should not be exposed publicly.
+struct InfoResponse: Content {
+    static var current: InfoResponse {
+        InfoResponse(
             hostname: ProcessInfo.processInfo.hostName,
+            platform: currentPlatform,
+            version: lumenVersion,
         )
     }
 
-    let status: String
+    private static var currentPlatform: String {
+        #if os(Linux)
+            "linux"
+        #elseif os(macOS)
+            "macos"
+        #else
+            "unknown"
+        #endif
+    }
+
     let hostname: String
+    let platform: String
+    let version: String
 }

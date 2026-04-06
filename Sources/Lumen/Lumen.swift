@@ -34,7 +34,8 @@ func routes(_ app: Application) throws {
     // Unprotected — just confirms the server is reachable
     app.get("health") { _ in HealthResponse.current }
 
-    // All execution routes require a valid bearer token
+    // Authenticated routes — require a valid bearer token
     let protected = app.grouped(APIKeyMiddleware())
+    protected.get("info") { _ in InfoResponse.current }
     try protected.register(collection: ExecController())
 }
