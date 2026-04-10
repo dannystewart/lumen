@@ -1,0 +1,524 @@
+import Vapor
+
+// MARK: - LumenInstaller
+
+struct LumenInstaller {
+    private let console: Console
+    private let options: InstallerOptions
+    private let fileManager: FileManager = .default
+
+    init(console: Console, options: InstallerOptions) throws {
+        self.console = console
+        self.options = options
+    }
+
+    private static func generateAPIKey() -> String {
+        let bytes = (0 ..< 32).map { _ in UInt8.random(in: .min ... .max) }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func expandTilde(in path: String) -> String {
+        if path == "~" {
+            return NSHomeDirectory()
+        }
+        if path.hasPrefix("~/") {
+            return (NSHomeDirectory() as NSString).appendingPathComponent(String(path.dropFirst(2)))
+        }
+        return path
+    }
+
+    private static func xmlUnescaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&apos;", with: "'")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&amp;", with: "&")
+    }
+
+    func run() throws {
+        let platform = InstallPlatform.current
+        let sourceBinaryPath = try self.resolveCurrentExecutablePath()
+
+        self.console.print("")
+        self.console.printHeader("Lumen v\(lumenVersion) for \(platform.displayName) • Installer")
+        self.console.printNote("Configure the service and install paths below.")
+        self.console.print("")
+
+        let existingInstall = InstallLocator().detectExistingInstall(on: platform)
+
+        let plan: InstallPlan
+        if let existingInstall {
+            self.console.printSection("Existing installation detected")
+            self.console.printLabelValue("Service type", value: existingInstall.runAsSystemService ? "system" : "user")
+            self.console.printLabelValue("Binary", value: existingInstall.binaryPath)
+            self.console.printLabelValue("Service", value: existingInstall.serviceFilePath)
+            self.console.print("")
+
+            if self.askBool(prompt: "Keep existing config and reinstall/upgrade?", defaultValue: true) {
+                let existingConfig = self.loadExistingConfig(from: existingInstall.serviceFilePath, platform: platform)
+                let preservedAPIKey = existingConfig.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                let allowSudo = try self.resolveAllowSudo(existingValue: existingConfig.allowSudo ?? false)
+
+                plan = InstallPlan(
+                    platform: platform,
+                    runAsSystemService: existingInstall.runAsSystemService,
+                    sourceBinaryPath: sourceBinaryPath,
+                    binaryPath: existingInstall.binaryPath,
+                    serviceFilePath: existingInstall.serviceFilePath,
+                    stdoutLogPath: existingInstall.stdoutLogPath,
+                    stderrLogPath: existingInstall.stderrLogPath,
+                    port: existingConfig.port ?? 9069,
+                    allowSudo: allowSudo,
+                    apiKey: (preservedAPIKey?.isEmpty == false) ? preservedAPIKey! : Self.generateAPIKey(),
+                    shouldRevealAPIKey: preservedAPIKey?.isEmpty != false,
+                    installAndStartNow: true,
+                    shouldShowPathNotice: false,
+                )
+            } else {
+                guard let interactivePlan = try self.buildInteractivePlan(platform: platform, sourceBinaryPath: sourceBinaryPath) else {
+                    return
+                }
+                plan = interactivePlan
+            }
+        } else {
+            guard let interactivePlan = try self.buildInteractivePlan(platform: platform, sourceBinaryPath: sourceBinaryPath) else {
+                return
+            }
+            plan = interactivePlan
+        }
+
+        self.console.print("")
+        self.console.printSection("Install plan")
+        self.console.printLabelValue("Service type", value: plan.runAsSystemService ? "system" : "user")
+        self.console.printLabelValue("Binary", value: plan.binaryPath)
+        self.console.printLabelValue("Service", value: plan.serviceFilePath)
+        self.console.printLabelValue("Port", value: String(plan.port))
+        if plan.allowSudo {
+            self.console.printWarning("Root access enabled")
+        }
+        self.console.print("")
+
+        let canWriteInstall = self.canWriteInstallTargets(for: plan)
+
+        guard canWriteInstall else {
+            self.console.printError("Installation requires elevated permissions. Re-run the installer with sudo.")
+            return
+        }
+
+        try self.install(plan)
+        if plan.installAndStartNow {
+            try self.startService(for: plan)
+            self.console.printSuccess("Lumen installed and started successfully!")
+        } else {
+            self.console.printSuccess("Lumen installed successfully!")
+        }
+        self.printAPIKeyIfNeeded(for: plan)
+        self.console.print("")
+        self.printPathNoticeIfNeeded(for: plan)
+        self.printCompletion(for: plan)
+    }
+
+    private func buildInteractivePlan(platform: InstallPlatform, sourceBinaryPath: String) throws -> InstallPlan? {
+        let runAsSystemService: Bool = switch platform {
+        case .macOS:
+            false
+        case .linux:
+            self.askBool(
+                prompt: "Run as a system service?",
+                defaultValue: false,
+            )
+        }
+
+        let defaults = InstallDefaults(platform: platform, runAsSystemService: runAsSystemService)
+
+        guard
+            self.canWriteInstallTargets(
+                for: InstallPlan(
+                    platform: platform,
+                    runAsSystemService: runAsSystemService,
+                    sourceBinaryPath: sourceBinaryPath,
+                    binaryPath: defaults.binaryPath,
+                    serviceFilePath: defaults.serviceFilePath,
+                    stdoutLogPath: defaults.stdoutLogPath,
+                    stderrLogPath: defaults.stderrLogPath,
+                    port: 9069,
+                    allowSudo: false,
+                    apiKey: "",
+                    shouldRevealAPIKey: false,
+                    installAndStartNow: true,
+                    shouldShowPathNotice: true,
+                ),
+            ) else
+        {
+            self.console.printError("Installation requires elevated permissions for this service type. Re-run the installer with sudo.")
+            return nil
+        }
+
+        let binaryPath = self.askString(
+            prompt: "Install binary to",
+            defaultValue: defaults.binaryPath,
+        )
+
+        let port = self.askPort(defaultValue: 9069)
+
+        let allowSudo = try self.resolveAllowSudo(existingValue: false)
+
+        let installAndStartNow = self.askBool(
+            prompt: "Install and start now?",
+            defaultValue: true,
+        )
+
+        let apiKeySelection = self.resolveAPIKeySelection()
+
+        return InstallPlan(
+            platform: platform,
+            runAsSystemService: runAsSystemService,
+            sourceBinaryPath: sourceBinaryPath,
+            binaryPath: binaryPath,
+            serviceFilePath: defaults.serviceFilePath,
+            stdoutLogPath: defaults.stdoutLogPath,
+            stderrLogPath: defaults.stderrLogPath,
+            port: port,
+            allowSudo: allowSudo,
+            apiKey: apiKeySelection.apiKey,
+            shouldRevealAPIKey: apiKeySelection.shouldRevealAPIKey,
+            installAndStartNow: installAndStartNow,
+            shouldShowPathNotice: binaryPath.hasPrefix(NSHomeDirectory()),
+        )
+    }
+
+    private func resolveAPIKeySelection() -> (apiKey: String, shouldRevealAPIKey: Bool) {
+        self.console.outputPrompt("Enter your Lumen API key, or press Enter to generate one: ")
+        let input = self.console.input(isSecure: false).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard input.isEmpty == false else {
+            return (Self.generateAPIKey(), true)
+        }
+
+        return (input, false)
+    }
+
+    private func resolveAllowSudo(existingValue: Bool) throws -> Bool {
+        guard self.options.allowSudoRequested else {
+            return existingValue
+        }
+
+        return self.askBool(
+            prompt: "Allowing privileged execution is dangerous and WILL NOT WORK unless your account is configured for non-interactive privilege escalation, such as passwordless sudo. Are you sure you want to continue?",
+            defaultValue: false,
+        )
+    }
+
+    private func install(_ plan: InstallPlan) throws {
+        let serviceContents = ServiceRenderer.serviceFile(for: plan)
+
+        let binaryDirectory = URL(fileURLWithPath: plan.binaryPath).deletingLastPathComponent()
+        let serviceDirectory = URL(fileURLWithPath: plan.serviceFilePath).deletingLastPathComponent()
+        let stdoutDirectory = URL(fileURLWithPath: plan.stdoutLogPath).deletingLastPathComponent()
+        let stderrDirectory = URL(fileURLWithPath: plan.stderrLogPath).deletingLastPathComponent()
+
+        try self.createDirectoryIfNeeded(binaryDirectory.path)
+        try self.createDirectoryIfNeeded(serviceDirectory.path)
+        try self.createDirectoryIfNeeded(stdoutDirectory.path)
+        try self.createDirectoryIfNeeded(stderrDirectory.path)
+
+        try self.setDirectoryPermissionsIfPossible(at: binaryDirectory.path, permissions: 0o755)
+        try self.setDirectoryPermissionsIfPossible(at: serviceDirectory.path, permissions: 0o755)
+        try self.setDirectoryPermissionsIfPossible(at: stdoutDirectory.path, permissions: 0o700)
+        try self.setDirectoryPermissionsIfPossible(at: stderrDirectory.path, permissions: 0o700)
+
+        if self.fileManager.fileExists(atPath: plan.binaryPath) {
+            try self.fileManager.removeItem(atPath: plan.binaryPath)
+        }
+        try self.fileManager.copyItem(atPath: plan.sourceBinaryPath, toPath: plan.binaryPath)
+
+        try serviceContents.write(toFile: plan.serviceFilePath, atomically: true, encoding: .utf8)
+
+        try self.setPermissionsIfPossible(for: plan)
+    }
+
+    private func loadExistingConfig(from path: String, platform: InstallPlatform) -> ExistingConfig {
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return ExistingConfig(apiKey: nil, port: nil, allowSudo: nil)
+        }
+
+        switch platform {
+        case .macOS:
+            return self.parseLaunchdConfig(contents)
+        case .linux:
+            return self.parseSystemdConfig(contents)
+        }
+    }
+
+    private func parseLaunchdConfig(_ contents: String) -> ExistingConfig {
+        func value(for key: String) -> String? {
+            let pattern = "<key>\\s*\(NSRegularExpression.escapedPattern(for: key))\\s*</key>\\s*<string>(.*?)</string>"
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
+                return nil
+            }
+
+            let range = NSRange(contents.startIndex..., in: contents)
+            guard
+                let match = regex.firstMatch(in: contents, options: [], range: range),
+                let valueRange = Range(match.range(at: 1), in: contents) else
+            {
+                return nil
+            }
+
+            return Self.xmlUnescaped(String(contents[valueRange])).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return ExistingConfig(
+            apiKey: value(for: "LUMEN_API_KEY"),
+            port: value(for: "LUMEN_PORT").flatMap(Int.init),
+            allowSudo: value(for: "LUMEN_ALLOW_SUDO").map { $0.lowercased() == "true" },
+        )
+    }
+
+    private func parseSystemdConfig(_ contents: String) -> ExistingConfig {
+        var apiKey: String?
+        var port: Int?
+        var allowSudo: Bool?
+
+        for rawLine in contents.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("Environment=") else { continue }
+
+            let remainder = String(line.dropFirst("Environment=".count))
+            let unquoted = remainder.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            guard let separator = unquoted.firstIndex(of: "=") else { continue }
+
+            let key = String(unquoted[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = String(unquoted[unquoted.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+            switch key {
+            case "LUMEN_API_KEY":
+                apiKey = value
+            case "LUMEN_PORT":
+                port = Int(value)
+            case "LUMEN_ALLOW_SUDO":
+                allowSudo = value.lowercased() == "true"
+            default:
+                continue
+            }
+        }
+
+        return ExistingConfig(apiKey: apiKey, port: port, allowSudo: allowSudo)
+    }
+
+    private func canWriteInstallTargets(for plan: InstallPlan) -> Bool {
+        [
+            plan.binaryPath,
+            plan.serviceFilePath,
+            plan.stdoutLogPath,
+            plan.stderrLogPath,
+        ].allSatisfy { self.canWritePath($0) }
+    }
+
+    private func canWritePath(_ path: String) -> Bool {
+        if self.fileManager.fileExists(atPath: path) {
+            return self.fileManager.isWritableFile(atPath: path)
+        }
+
+        let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
+        if parent == path || parent.isEmpty {
+            return false
+        }
+
+        if self.fileManager.fileExists(atPath: parent) {
+            return self.fileManager.isWritableFile(atPath: parent)
+        }
+
+        return self.canWritePath(parent)
+    }
+
+    private func setPermissionsIfPossible(for plan: InstallPlan) throws {
+        try? self.fileManager.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: plan.binaryPath,
+        )
+        try? self.fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: plan.serviceFilePath,
+        )
+    }
+
+    private func setDirectoryPermissionsIfPossible(at path: String, permissions: Int) throws {
+        try? self.fileManager.setAttributes(
+            [.posixPermissions: permissions],
+            ofItemAtPath: path,
+        )
+    }
+
+    private func printAPIKeyIfNeeded(for plan: InstallPlan) {
+        guard plan.shouldRevealAPIKey else {
+            self.console.printSuccess("API key unchanged. Existing Prism connections should continue working.")
+            return
+        }
+
+        self.console.print("")
+        self.console.printWarning("Save this API key now — it will not be shown again:")
+        self.console.print(plan.apiKey)
+    }
+
+    private func printPathNoticeIfNeeded(for plan: InstallPlan) {
+        guard plan.shouldShowPathNotice else { return }
+
+        let binaryDirectory = URL(fileURLWithPath: plan.binaryPath).deletingLastPathComponent().path
+        self.console.print("")
+        self.console.printPathNotice(binaryDirectory)
+        self.console.print("")
+    }
+
+    private func printCompletion(for plan: InstallPlan) {
+        guard plan.installAndStartNow == false else { return }
+
+        self.console.printSection("When you're ready, start the service with:")
+        self.console.printCommand("lumen start")
+    }
+
+    private func startService(for plan: InstallPlan) throws {
+        for command in self.startCommands(for: plan) {
+            try self.runShellCommand(command)
+        }
+    }
+
+    private func startCommands(for plan: InstallPlan) -> [String] {
+        switch plan.platform {
+        case .macOS:
+            if plan.runAsSystemService {
+                return [
+                    "launchctl bootstrap system \(shellQuote(plan.serviceFilePath))",
+                ]
+            } else {
+                let uid = getuid()
+                return [
+                    "launchctl bootstrap gui/\(uid) \(shellQuote(plan.serviceFilePath))",
+                ]
+            }
+
+        case .linux:
+            if plan.runAsSystemService {
+                return [
+                    "systemctl daemon-reload",
+                    "systemctl enable --now lumen.service",
+                ]
+            } else {
+                return [
+                    "systemctl --user daemon-reload",
+                    "systemctl --user enable --now lumen.service",
+                ]
+            }
+        }
+    }
+
+    private func runShellCommand(_ command: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", command]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            throw Abort(.internalServerError, reason: "Failed to run command: \(command)")
+        }
+    }
+
+    private func createDirectoryIfNeeded(_ path: String) throws {
+        try self.fileManager.createDirectory(
+            at: URL(fileURLWithPath: path),
+            withIntermediateDirectories: true,
+        )
+    }
+
+    private func askString(prompt: String, defaultValue: String) -> String {
+        self.console.outputPrompt("\(prompt) [\(defaultValue)]: ")
+        let input = self.console.input(isSecure: false).trimmingCharacters(in: .whitespacesAndNewlines)
+        return input.isEmpty ? defaultValue : Self.expandTilde(in: input)
+    }
+
+    private func askBool(prompt: String, defaultValue: Bool) -> Bool {
+        let suffix = defaultValue ? "[Y/n]" : "[y/N]"
+
+        while true {
+            self.console.outputPrompt("\(prompt) \(suffix): ")
+            let input = self.console.input(isSecure: false).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+            if input.isEmpty {
+                return defaultValue
+            }
+
+            switch input {
+            case "y", "yes":
+                return true
+            case "n", "no":
+                return false
+            default:
+                self.console.printError("Please enter y or n.")
+            }
+        }
+    }
+
+    private func askPort(defaultValue: Int) -> Int {
+        while true {
+            self.console.outputPrompt("Port [\(defaultValue)]: ")
+            let input = self.console.input(isSecure: false).trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if input.isEmpty {
+                return defaultValue
+            }
+
+            if let value = Int(input), (1 ... 65535).contains(value) {
+                return value
+            }
+
+            self.console.printError("Please enter a valid port between 1 and 65535.")
+        }
+    }
+
+    private func resolveCurrentExecutablePath() throws -> String {
+        let executable = CommandLine.arguments.first ?? ProcessInfo.processInfo.arguments.first ?? "./lumen"
+        let expanded = Self.expandTilde(in: executable)
+
+        if expanded.hasPrefix("/") {
+            return expanded
+        }
+
+        let currentDirectory = self.fileManager.currentDirectoryPath
+        let workingDirectoryCandidate = URL(fileURLWithPath: currentDirectory)
+            .appendingPathComponent(expanded)
+            .standardizedFileURL
+            .path
+
+        if self.fileManager.fileExists(atPath: workingDirectoryCandidate) {
+            return workingDirectoryCandidate
+        }
+
+        let executableURL = URL(fileURLWithPath: executable)
+        let swiftPMBuildPathComponents = executableURL.pathComponents.suffix(4)
+        if
+            swiftPMBuildPathComponents.count == 4,
+            swiftPMBuildPathComponents[0] == ".build",
+            swiftPMBuildPathComponents[2] == "debug"
+        {
+            let swiftPMCandidate = URL(fileURLWithPath: currentDirectory)
+                .appendingPathComponent(".build")
+                .appendingPathComponent(swiftPMBuildPathComponents[1])
+                .appendingPathComponent("debug")
+                .appendingPathComponent(swiftPMBuildPathComponents[3])
+                .standardizedFileURL
+                .path
+
+            if self.fileManager.fileExists(atPath: swiftPMCandidate) {
+                return swiftPMCandidate
+            }
+        }
+
+        return executableURL.standardizedFileURL.path
+    }
+}

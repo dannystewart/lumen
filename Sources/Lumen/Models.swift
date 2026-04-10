@@ -33,10 +33,23 @@ struct HealthResponse: Content {
 struct InfoResponse: Content {
     static var current: InfoResponse {
         InfoResponse(
-            hostname: ProcessInfo.processInfo.hostName,
+            hostname: normalizedHostname,
             platform: currentPlatform,
             version: lumenVersion,
         )
+    }
+
+    private static var normalizedHostname: String {
+        let rawHostname = ProcessInfo.processInfo.hostName
+        let suffixes = [".local", ".lan", ".home"]
+
+        for suffix in suffixes {
+            if rawHostname.lowercased().hasSuffix(suffix) {
+                return String(rawHostname.dropLast(suffix.count))
+            }
+        }
+
+        return rawHostname
     }
 
     private static var currentPlatform: String {
