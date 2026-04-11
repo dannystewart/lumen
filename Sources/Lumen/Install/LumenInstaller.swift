@@ -229,6 +229,8 @@ struct LumenInstaller {
         try self.setDirectoryPermissionsIfPossible(at: stdoutDirectory.path, permissions: 0o700)
         try self.setDirectoryPermissionsIfPossible(at: stderrDirectory.path, permissions: 0o700)
 
+        try self.stopServiceIfNeeded(for: plan)
+
         if self.fileManager.fileExists(atPath: plan.binaryPath) {
             try self.fileManager.removeItem(atPath: plan.binaryPath)
         }
@@ -385,6 +387,17 @@ struct LumenInstaller {
         }
     }
 
+    private func stopServiceIfNeeded(for plan: InstallPlan) throws {
+        for command in self.stopCommands(for: plan) {
+            try self.runShellCommand(command, allowFailuresMatching: [
+                "could not find service",
+                "service is disabled",
+                "no such process",
+                "not loaded",
+            ])
+        }
+    }
+
     private func startCommands(for plan: InstallPlan) -> [String] {
         switch plan.platform {
         case .macOS:
@@ -414,19 +427,69 @@ struct LumenInstaller {
         }
     }
 
-    private func runShellCommand(_ command: String) throws {
+    private func stopCommands(for plan: InstallPlan) -> [String] {
+        switch plan.platform {
+        case .macOS:
+            if plan.runAsSystemService {
+                return [
+                    "launchctl bootout system \(shellQuote(plan.serviceFilePath))",
+                ]
+            } else {
+                let uid = getuid()
+                return [
+                    "launchctl bootout gui/\(uid) \(shellQuote(plan.serviceFilePath))",
+                ]
+            }
+
+        case .linux:
+            if plan.runAsSystemService {
+                return [
+                    "systemctl stop lumen.service",
+                    "systemctl daemon-reload",
+                ]
+            } else {
+                return [
+                    "systemctl --user stop lumen.service",
+                    "systemctl --user daemon-reload",
+                ]
+            }
+        }
+    }
+
+    private func runShellCommand(
+        _ command: String,
+        allowFailuresMatching allowedFailureSubstrings: [String] = [],
+    ) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", command]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
 
         try process.run()
         process.waitUntilExit()
 
-        guard process.terminationStatus == 0 else {
-            throw Abort(.internalServerError, reason: "Failed to run command: \(command)")
+        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let combinedOutput = "\(stdout)\n\(stderr)".lowercased()
+
+        guard process.terminationStatus != 0 else {
+            return
         }
+
+        if allowedFailureSubstrings.contains(where: { combinedOutput.contains($0) }) {
+            return
+        }
+
+        throw Abort(
+            .internalServerError,
+            reason: combinedOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Failed to run command: \(command)"
+                : "Failed to run command: \(command)\n\(stdout)\n\(stderr)".trimmingCharacters(in: .whitespacesAndNewlines),
+        )
     }
 
     private func createDirectoryIfNeeded(_ path: String) throws {
