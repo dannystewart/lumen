@@ -106,4 +106,5 @@ func routes(_ app: Application) throws {
     let protected = app.grouped(APIKeyMiddleware())
     protected.get("info") { _ in InfoResponse.current }
     try protected.register(collection: ExecController())
+    try protected.register(collection: FileController())
 }
