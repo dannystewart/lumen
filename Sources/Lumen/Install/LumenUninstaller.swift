@@ -36,7 +36,7 @@ struct LumenUninstaller {
             return
         }
 
-        if !self.askBool(prompt: "Remove this installation?", defaultValue: true) {
+        if !self.console.askBool(prompt: "Remove this installation?", defaultValue: true) {
             self.console.printWarning("Uninstall cancelled.")
             self.console.print("")
             return
@@ -71,24 +71,7 @@ struct LumenUninstaller {
     }
 
     private func canWriteRemovalTargets(for install: ExistingInstall) -> Bool {
-        [install.binaryPath, install.serviceFilePath].allSatisfy { self.canWritePath($0) }
-    }
-
-    private func canWritePath(_ path: String) -> Bool {
-        if self.fileManager.fileExists(atPath: path) {
-            return self.fileManager.isWritableFile(atPath: path)
-        }
-
-        let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
-        if parent == path || parent.isEmpty {
-            return false
-        }
-
-        if self.fileManager.fileExists(atPath: parent) {
-            return self.fileManager.isWritableFile(atPath: parent)
-        }
-
-        return self.canWritePath(parent)
+        [install.binaryPath, install.serviceFilePath].allSatisfy { self.fileManager.canWritePath($0) }
     }
 
     private func stopCommands(for install: ExistingInstall, platform: InstallPlatform) -> [String] {
@@ -132,28 +115,6 @@ struct LumenUninstaller {
             process.waitUntilExit()
         } catch {
             // best-effort stop before file removal
-        }
-    }
-
-    private func askBool(prompt: String, defaultValue: Bool) -> Bool {
-        let suffix = defaultValue ? "[Y/n]" : "[y/N]"
-
-        while true {
-            self.console.outputPrompt("\(prompt) \(suffix): ")
-            let input = self.console.input(isSecure: false).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-
-            if input.isEmpty {
-                return defaultValue
-            }
-
-            switch input {
-            case "y", "yes":
-                return true
-            case "n", "no":
-                return false
-            default:
-                self.console.printError("Please enter y or n.")
-            }
         }
     }
 }

@@ -27,15 +27,6 @@ struct LumenInstaller {
         return path
     }
 
-    private static func xmlUnescaped(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "&apos;", with: "'")
-            .replacingOccurrences(of: "&quot;", with: "\"")
-            .replacingOccurrences(of: "&gt;", with: ">")
-            .replacingOccurrences(of: "&lt;", with: "<")
-            .replacingOccurrences(of: "&amp;", with: "&")
-    }
-
     func run() throws {
         let platform = InstallPlatform.current
         let sourceBinaryPath = try self.resolveCurrentExecutablePath()
@@ -55,8 +46,8 @@ struct LumenInstaller {
             self.console.printLabelValue("Service", value: existingInstall.serviceFilePath)
             self.console.print("")
 
-            if self.askBool(prompt: "Keep existing config and reinstall/upgrade?", defaultValue: true) {
-                let existingConfig = self.loadExistingConfig(from: existingInstall.serviceFilePath, platform: platform)
+            if self.console.askBool(prompt: "Keep existing config and reinstall/upgrade?", defaultValue: true) {
+                let existingConfig = ConfigParser.loadExistingConfig(from: existingInstall.serviceFilePath, platform: platform)
                 let preservedAPIKey = existingConfig.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
 
                 let allowSudo = try self.resolveAllowSudo(existingValue: existingConfig.allowSudo ?? false)
@@ -125,7 +116,7 @@ struct LumenInstaller {
         case .macOS:
             false
         case .linux:
-            self.askBool(
+            self.console.askBool(
                 prompt: "Run as a system service?",
                 defaultValue: false,
             )
@@ -165,7 +156,7 @@ struct LumenInstaller {
 
         let allowSudo = try self.resolveAllowSudo(existingValue: false)
 
-        let installAndStartNow = self.askBool(
+        let installAndStartNow = self.console.askBool(
             prompt: "Install and start now?",
             defaultValue: true,
         )
@@ -205,7 +196,7 @@ struct LumenInstaller {
             return existingValue
         }
 
-        return self.askBool(
+        return self.console.askBool(
             prompt: "Allowing privileged execution is dangerous and WILL NOT WORK unless your account is configured for non-interactive privilege escalation, such as passwordless sudo. Are you sure you want to continue?",
             defaultValue: false,
         )
@@ -241,99 +232,13 @@ struct LumenInstaller {
         try self.setPermissionsIfPossible(for: plan)
     }
 
-    private func loadExistingConfig(from path: String, platform: InstallPlatform) -> ExistingConfig {
-        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return ExistingConfig(apiKey: nil, port: nil, allowSudo: nil)
-        }
-
-        switch platform {
-        case .macOS:
-            return self.parseLaunchdConfig(contents)
-        case .linux:
-            return self.parseSystemdConfig(contents)
-        }
-    }
-
-    private func parseLaunchdConfig(_ contents: String) -> ExistingConfig {
-        func value(for key: String) -> String? {
-            let pattern = "<key>\\s*\(NSRegularExpression.escapedPattern(for: key))\\s*</key>\\s*<string>(.*?)</string>"
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
-                return nil
-            }
-
-            let range = NSRange(contents.startIndex..., in: contents)
-            guard
-                let match = regex.firstMatch(in: contents, options: [], range: range),
-                let valueRange = Range(match.range(at: 1), in: contents) else
-            {
-                return nil
-            }
-
-            return Self.xmlUnescaped(String(contents[valueRange])).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        return ExistingConfig(
-            apiKey: value(for: "LUMEN_API_KEY"),
-            port: value(for: "LUMEN_PORT").flatMap(Int.init),
-            allowSudo: value(for: "LUMEN_ALLOW_SUDO").map { $0.lowercased() == "true" },
-        )
-    }
-
-    private func parseSystemdConfig(_ contents: String) -> ExistingConfig {
-        var apiKey: String?
-        var port: Int?
-        var allowSudo: Bool?
-
-        for rawLine in contents.components(separatedBy: .newlines) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard line.hasPrefix("Environment=") else { continue }
-
-            let remainder = String(line.dropFirst("Environment=".count))
-            let unquoted = remainder.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-            guard let separator = unquoted.firstIndex(of: "=") else { continue }
-
-            let key = String(unquoted[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
-            let value = String(unquoted[unquoted.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-
-            switch key {
-            case "LUMEN_API_KEY":
-                apiKey = value
-            case "LUMEN_PORT":
-                port = Int(value)
-            case "LUMEN_ALLOW_SUDO":
-                allowSudo = value.lowercased() == "true"
-            default:
-                continue
-            }
-        }
-
-        return ExistingConfig(apiKey: apiKey, port: port, allowSudo: allowSudo)
-    }
-
     private func canWriteInstallTargets(for plan: InstallPlan) -> Bool {
         [
             plan.binaryPath,
             plan.serviceFilePath,
             plan.stdoutLogPath,
             plan.stderrLogPath,
-        ].allSatisfy { self.canWritePath($0) }
-    }
-
-    private func canWritePath(_ path: String) -> Bool {
-        if self.fileManager.fileExists(atPath: path) {
-            return self.fileManager.isWritableFile(atPath: path)
-        }
-
-        let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
-        if parent == path || parent.isEmpty {
-            return false
-        }
-
-        if self.fileManager.fileExists(atPath: parent) {
-            return self.fileManager.isWritableFile(atPath: parent)
-        }
-
-        return self.canWritePath(parent)
+        ].allSatisfy { self.fileManager.canWritePath($0) }
     }
 
     private func setPermissionsIfPossible(for plan: InstallPlan) throws {
@@ -503,28 +408,6 @@ struct LumenInstaller {
         self.console.outputPrompt("\(prompt) [\(defaultValue)]: ")
         let input = self.console.input(isSecure: false).trimmingCharacters(in: .whitespacesAndNewlines)
         return input.isEmpty ? defaultValue : Self.expandTilde(in: input)
-    }
-
-    private func askBool(prompt: String, defaultValue: Bool) -> Bool {
-        let suffix = defaultValue ? "[Y/n]" : "[y/N]"
-
-        while true {
-            self.console.outputPrompt("\(prompt) \(suffix): ")
-            let input = self.console.input(isSecure: false).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-
-            if input.isEmpty {
-                return defaultValue
-            }
-
-            switch input {
-            case "y", "yes":
-                return true
-            case "n", "no":
-                return false
-            default:
-                self.console.printError("Please enter y or n.")
-            }
-        }
     }
 
     private func askPort(defaultValue: Int) -> Int {
