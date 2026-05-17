@@ -337,12 +337,12 @@ struct LumenInstaller {
         case .macOS:
             if plan.runAsSystemService {
                 return [
-                    "launchctl bootout system \(shellQuote(plan.serviceFilePath))",
+                    "launchctl bootout system/\(plan.platform.serviceLabel)",
                 ]
             } else {
                 let uid = getuid()
                 return [
-                    "launchctl bootout gui/\(uid) \(shellQuote(plan.serviceFilePath))",
+                    "launchctl bootout gui/\(uid)/\(plan.platform.serviceLabel)",
                 ]
             }
 

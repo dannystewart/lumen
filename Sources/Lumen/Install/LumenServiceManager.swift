@@ -347,7 +347,7 @@ struct LumenServiceManager {
             ["launchctl bootstrap \(self.targetPrefix(for: install)) \(shellQuote(install.serviceFilePath))"]
 
         case .stop:
-            ["launchctl bootout \(self.targetPrefix(for: install)) \(shellQuote(install.serviceFilePath))"]
+            ["launchctl bootout \(target)"]
 
         case .restart:
             if install.runAsSystemService {

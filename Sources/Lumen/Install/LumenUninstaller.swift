@@ -79,12 +79,12 @@ struct LumenUninstaller {
         case .macOS:
             if install.runAsSystemService {
                 return [
-                    "launchctl bootout system \(shellQuote(install.serviceFilePath))",
+                    "launchctl bootout system/\(platform.serviceLabel)",
                 ]
             } else {
                 let uid = getuid()
                 return [
-                    "launchctl bootout gui/\(uid) \(shellQuote(install.serviceFilePath))",
+                    "launchctl bootout gui/\(uid)/\(platform.serviceLabel)",
                 ]
             }
 
